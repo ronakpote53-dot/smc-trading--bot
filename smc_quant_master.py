@@ -12,7 +12,14 @@ import time
 import requests
 import pandas as pd
 import numpy as np
-import MetaTrader5 as mt5
+
+# Safe import for MetaTrader5 (Handles Linux Cloud & Windows compatibility)
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+    print("[SYSTEM WARNING] MetaTrader5 library not found. Running in Cloud/Webhook Mode.")
 
 # ==========================================
 # 1. GLOBAL SYSTEM CONFIGURATION
@@ -20,7 +27,7 @@ import MetaTrader5 as mt5
 class Config:
     # MT5 Broker Credentials (Exness Demo Account)
     MT5_ACCOUNT = 480412532
-    MT5_PASSWORD = "Gubu@123"                 # Configured with your Exness Password
+    MT5_PASSWORD = "Gubu@123"                 
     MT5_SERVER = "Exness-MT5Trial"            
     
     # Risk Management Rules (Universal for any account balance)
@@ -30,7 +37,6 @@ class Config:
     
     # AI API Keys
     OPENAI_API_KEY = "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"
-    CLAUDE_API_KEY = "YOUR_CLAUDE_API_KEY"
     
     # Telegram Control & Notifications
     TELEGRAM_BOT_TOKEN = "8850686281:AAFQms3YLnynRzHTP8BpZv-AjG5gpNZszpw"
@@ -38,7 +44,6 @@ class Config:
     
     # Execution Settings
     SYMBOLS = ["EURUSD", "GBPUSD", "XAUUSD"]
-    TIMEFRAME = mt5.TIMEFRAME_M15
 
 
 # ==========================================
@@ -47,7 +52,7 @@ class Config:
 class TelegramNotifier:
     @staticmethod
     def send_message(message: str):
-        if Config.TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        if not Config.TELEGRAM_BOT_TOKEN or Config.TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
             return False
         url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": Config.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
@@ -69,7 +74,7 @@ class AIAnalyzer:
         Sends aggregated market data & SMC structure to OpenAI
         for higher-timeframe confirmation before trade entry.
         """
-        if Config.OPENAI_API_KEY == "YOUR_OPENAI_API_KEY":
+        if not Config.OPENAI_API_KEY or "YOUR_OPENAI" in Config.OPENAI_API_KEY:
             return "GO - Strategy Override (No API Key Configured)"
 
         prompt = (
@@ -107,7 +112,18 @@ class SMCEngine:
         self.symbol = symbol
 
     def fetch_market_data(self, num_bars=100) -> pd.DataFrame:
-        rates = mt5.copy_rates_from_pos(self.symbol, Config.TIMEFRAME, 0, num_bars)
+        if not MT5_AVAILABLE:
+            # Mock Data for Cloud/Non-Windows testing
+            df = pd.DataFrame({
+                'time': pd.date_range(end=pd.Timestamp.now(), periods=num_bars, freq='15min'),
+                'open': np.random.uniform(1.08, 1.09, num_bars),
+                'high': np.random.uniform(1.09, 1.10, num_bars),
+                'low': np.random.uniform(1.07, 1.08, num_bars),
+                'close': np.random.uniform(1.08, 1.09, num_bars)
+            })
+            return df
+
+        rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M15, 0, num_bars)
         if rates is None or len(rates) == 0:
             return pd.DataFrame()
         df = pd.DataFrame(rates)
@@ -148,10 +164,15 @@ class SMCEngine:
 # ==========================================
 class MasterQuantEngine:
     def __init__(self):
-        self.initial_daily_balance = 0.0
+        self.initial_daily_balance = 10000.0  # Default mock balance for safety
         self.circuit_breaker_active = False
 
     def initialize_mt5(self):
+        if not MT5_AVAILABLE:
+            print("[CLOUD MODE] MT5 not supported on this OS. Running in Signal & Alert Simulation Mode.")
+            TelegramNotifier.send_message("🚀 *SMC QUANT ENGINE STARTED (Cloud Mode)*\n• Running 24/7 Monitoring & AI Validation.")
+            return True
+
         if not mt5.initialize():
             print("[CRITICAL] Failed to initialize MT5 Engine.")
             return False
@@ -162,7 +183,9 @@ class MasterQuantEngine:
             return False
 
         account_info = mt5.account_info()
-        self.initial_daily_balance = account_info.balance
+        if account_info:
+            self.initial_daily_balance = account_info.balance
+            
         print(f"[INFO] MT5 Connected. Account: {Config.MT5_ACCOUNT} | Initial Balance: ${self.initial_daily_balance:.2f}")
         
         TelegramNotifier.send_message(
@@ -174,6 +197,9 @@ class MasterQuantEngine:
         return True
 
     def calculate_safe_lot_size(self) -> float:
+        if not MT5_AVAILABLE:
+            return Config.MIN_LOT_SIZE
+            
         account = mt5.account_info()
         if account is None or account.balance <= 0:
             return Config.MIN_LOT_SIZE
@@ -182,6 +208,9 @@ class MasterQuantEngine:
         return max(calculated_lot, Config.MIN_LOT_SIZE)
 
     def check_circuit_breaker(self) -> bool:
+        if not MT5_AVAILABLE:
+            return False
+
         account = mt5.account_info()
         if account is None:
             return False
@@ -193,7 +222,6 @@ class MasterQuantEngine:
         if current_drawdown >= max_allowed_loss:
             self.circuit_breaker_active = True
             print(f"[ALERT] Daily 3% Circuit Breaker Hit! Halting trading activity.")
-            
             self.emergency_close_all()
             
             TelegramNotifier.send_message(
@@ -207,10 +235,15 @@ class MasterQuantEngine:
         return False
 
     def emergency_close_all(self):
+        if not MT5_AVAILABLE:
+            return
+            
         positions = mt5.positions_get()
         if positions:
             for pos in positions:
                 tick = mt5.symbol_info_tick(pos.symbol)
+                if not tick:
+                    continue
                 type_dict = {0: mt5.ORDER_TYPE_SELL, 1: mt5.ORDER_TYPE_BUY}
                 price_dict = {0: tick.bid, 1: tick.ask}
                 
@@ -230,13 +263,24 @@ class MasterQuantEngine:
                 mt5.order_send(request)
 
     def send_order(self, symbol: str, signal: str):
+        lot_size = self.calculate_safe_lot_size()
+        
+        if not MT5_AVAILABLE:
+            print(f"[SIMULATED ORDER] {symbol} {signal} Volume: {lot_size}")
+            TelegramNotifier.send_message(
+                f"✅ *SIMULATED ORDER EXECUTED (Cloud Mode)*\n"
+                f"• Symbol: `{symbol}`\n"
+                f"• Type: `{signal}`\n"
+                f"• Volume: `{lot_size}`"
+            )
+            return
+
         tick = mt5.symbol_info_tick(symbol)
         if not tick:
             return
 
         order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
         price = tick.ask if signal == "BUY" else tick.bid
-        lot_size = self.calculate_safe_lot_size()
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
